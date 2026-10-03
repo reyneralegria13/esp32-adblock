@@ -1,5 +1,3 @@
-<div align="center">
-
 ---
 
 ## ✨ Recursos
@@ -19,7 +17,17 @@
 
 ## 📸 Capturas
 
-<div align="center">
+### Dashboard web
+
+![Dashboard web do ESP32 AdBlock](assets/dashboard.png)
+
+![Aparelhos, listas pessoais e sistema no dashboard](assets/dashboard2.png)
+
+### Tela embarcada
+
+![ESP32 com o painel na tela embarcada](assets/Embarcado.jpeg)
+
+![Tela embarcada e interface web](assets/embarcado-web.jpg)
 
 ---
 
