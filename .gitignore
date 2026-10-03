@@ -1,0 +1,6 @@
+# build do PlatformIO
+.pio/
+.vscode/
+
+# lista gerada por build_blocklist.py
+data/
