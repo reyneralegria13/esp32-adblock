@@ -27,8 +27,6 @@ Bloqueador de anúncios e rastreadores para toda a rede, com servidor DNS na ESP
 
 ### Tela embarcada
 
-![ESP32 com o painel na tela embarcada](assets/Embarcado.jpeg)
-
 ![Tela embarcada e interface web](assets/embarcado-web.jpg)
 
 ---
