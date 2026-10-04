@@ -1,17 +1,19 @@
----
+# ESP32 AdBlock
+
+Bloqueador de anúncios e rastreadores para toda a rede, com servidor DNS na ESP32, dashboard web, tela embarcada e console SSH.
 
 ## ✨ Recursos
 
-|                                      |                                                                                                                                                                |
-| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 🚫**Bloqueio na rede inteira** | Celulares, TVs, consoles e PCs ficam protegidos sem instalar nada: basta apontar o DNS do roteador para a placa.                                               |
-| ⚡**Rápido e leve**           | Mais de 72 mil domínios ficam na flash como hashes ordenados. Cada consulta é resolvida com uma busca binária de ~17 leituras, sem carregar a lista na RAM. |
-| 🌳**Bloqueia subdomínios**    | Se`doubleclick.net` está na lista, `ad.doubleclick.net` e `x.y.doubleclick.net` também são bloqueados.                                                |
-| 📊**Dashboard web**            | Gráfico por minuto, ranking dos domínios mais bloqueados, aparelhos da rede, histórico ao vivo, tema claro/escuro e layout para celular.                    |
-| 🖥️**Tela embarcada**         | Painel na própria placa (CYD 2.8") com estado, contadores e os últimos domínios bloqueados.                                                                 |
-| 🔐**Console SSH**              | Servidor SSH nativo (libssh, chave Ed25519 gerada na placa) para administrar pelo terminal.                                                                    |
-| 📝**Listas pessoais**          | Bloqueie ou libere domínios na hora. As listas ficam salvas na NVS e sobrevivem a reinícios.                                                                 |
-| ⏸️**Pausa temporária**      | Desligue o bloqueio por 5 min, 30 min ou 1 h. Ele volta sozinho.                                                                                               |
+| Recurso | Descrição |
+| --- | --- |
+| 🚫 **Bloqueio na rede inteira** | Celulares, TVs, consoles e PCs ficam protegidos sem instalar nada: basta apontar o DNS do roteador para a placa. |
+| ⚡ **Rápido e leve** | Mais de 72 mil domínios ficam na flash como hashes ordenados. Cada consulta é resolvida com uma busca binária de ~17 leituras, sem carregar a lista na RAM. |
+| 🌳 **Bloqueia subdomínios** | Se `doubleclick.net` está na lista, `ad.doubleclick.net` e `x.y.doubleclick.net` também são bloqueados. |
+| 📊 **Dashboard web** | Gráfico por minuto, ranking dos domínios mais bloqueados, aparelhos da rede, histórico ao vivo, tema claro/escuro e layout para celular. |
+| 🖥️ **Tela embarcada** | Painel na própria placa (CYD 2.8") com estado, contadores e os últimos domínios bloqueados. |
+| 🔐 **Console SSH** | Servidor SSH nativo (libssh, chave Ed25519 gerada na placa) para administrar pelo terminal. |
+| 📝 **Listas pessoais** | Bloqueie ou libere domínios na hora. As listas ficam salvas na NVS e sobrevivem a reinícios. |
+| ⏸️ **Pausa temporária** | Desligue o bloqueio por 5 min, 30 min ou 1 h. Ele volta sozinho. |
 
 ---
 
