@@ -4,16 +4,17 @@ Bloqueador de anúncios e rastreadores para toda a rede, com servidor DNS na ESP
 
 ## ✨ Recursos
 
-| Recurso | Descrição |
-| --- | --- |
-| 🚫 **Bloqueio na rede inteira** | Celulares, TVs, consoles e PCs ficam protegidos sem instalar nada: basta apontar o DNS do roteador para a placa. |
-| ⚡ **Rápido e leve** | Mais de 72 mil domínios ficam na flash como hashes ordenados. Cada consulta é resolvida com uma busca binária de ~17 leituras, sem carregar a lista na RAM. |
-| 🌳 **Bloqueia subdomínios** | Se `doubleclick.net` está na lista, `ad.doubleclick.net` e `x.y.doubleclick.net` também são bloqueados. |
-| 📊 **Dashboard web** | Gráfico por minuto, ranking dos domínios mais bloqueados, aparelhos da rede, histórico ao vivo, tema claro/escuro e layout para celular. |
-| 🖥️ **Tela embarcada** | Painel na própria placa (CYD 2.8") com estado, contadores e os últimos domínios bloqueados. |
-| 🔐 **Console SSH** | Servidor SSH nativo (libssh, chave Ed25519 gerada na placa) para administrar pelo terminal. |
-| 📝 **Listas pessoais** | Bloqueie ou libere domínios na hora. As listas ficam salvas na NVS e sobrevivem a reinícios. |
-| ⏸️ **Pausa temporária** | Desligue o bloqueio por 5 min, 30 min ou 1 h. Ele volta sozinho. |
+| Recurso                              | Descrição                                                                                                                                                    |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 🚫**Bloqueio na rede inteira** | Celulares, TVs, consoles e PCs ficam protegidos sem instalar nada: basta apontar o DNS do roteador para a placa.                                               |
+| ⚡**Rápido e leve**           | Mais de 72 mil domínios ficam na flash como hashes ordenados. Cada consulta é resolvida com uma busca binária de ~17 leituras, sem carregar a lista na RAM. |
+| 🌳**Bloqueia subdomínios**    | Se`doubleclick.net` está na lista, `ad.doubleclick.net` e `x.y.doubleclick.net` também são bloqueados.                                                |
+| 📊**Dashboard web**            | Gráfico por minuto, ranking dos domínios mais bloqueados, aparelhos da rede, histórico ao vivo, tema claro/escuro e layout para celular.                    |
+| 🖥️**Tela embarcada**         | Painel na própria placa (CYD 2.8") com estado, contadores e os últimos domínios bloqueados.                                                                 |
+| 🔐**Console SSH**              | Servidor SSH nativo (libssh, chave Ed25519 gerada na placa) para administrar pelo terminal.                                                                    |
+| 📝**Listas pessoais**          | Bloqueie ou libere domínios na hora. As listas ficam salvas na NVS e sobrevivem a reinícios.                                                                 |
+| ⏸️**Pausa temporária**      | Desligue o bloqueio por 5 min, 30 min ou 1 h. Ele volta sozinho.                                                                                               |
+| 📶**Filtro por MAC** | Opcional: só os aparelhos com MAC autorizado recebem resposta de DNS. Liga e desliga pelo dashboard. |
 
 ---
 
@@ -49,10 +50,12 @@ flowchart LR
 ### Ordem de decisão
 
 ```
+0. Filtro de MAC ligado e aparelho  → MAC fora da lista? → BLOQUEIA tudo
 1. Lista de liberados (allow)       → sufixo bate?  → PERMITE
 2. Lista pessoal de bloqueio        → sufixo bate?  → BLOQUEIA
-3. Lista principal (block.bin)      → hash bate?    → BLOQUEIA
-4. Nenhuma                          →               → REPASSA ao DNS externo
+3. DNS criptografado (DoH/relés)    → sufixo bate?  → NXDOMAIN
+4. Lista principal (block.bin)      → hash bate?    → BLOQUEIA
+5. Nenhuma                          →               → REPASSA ao DNS externo
 ```
 
 Todas as verificações sobem pelos domínios pai: `a.b.ads.com` testa `a.b.ads.com`, depois `b.ads.com` e depois `ads.com`. O TLD sozinho (`com`) nunca é testado.
@@ -118,6 +121,9 @@ Como os 72 mil domínios em texto não caberiam nos ~320 KB de RAM da ESP32, a p
   - `A` → `0.0.0.0` e `AAAA` → `::`, com TTL de 60 s;
   - outros tipos (`HTTPS`, `TXT`…) → resposta vazia (NODATA).
 - **Consulta permitida:** o pacote é repassado ao DNS externo com um **ID de transação aleatório** (`esp_random()`), para dificultar respostas forjadas. A resposta só é aceita se vier do IP do DNS configurado e com um ID pendente. Até 64 consultas podem estar em andamento ao mesmo tempo.
+- **TTL limitado a 120 s:** as respostas repassadas têm o TTL reduzido, então um site recém-bloqueado para de abrir em até 2 minutos, em vez de ficar horas no cache do aparelho.
+- **DNS criptografado:** os endereços de DoH mais comuns (`dns.google`, `cloudflare-dns.com`, `dns.quad9.net`…), o domínio-sinal do Firefox (`use-application-dns.net`) e o iCloud Private Relay (`mask.icloud.com`) recebem `NXDOMAIN`. Assim o navegador volta a usar o DNS da rede e o bloqueio passa a valer. Para liberar um deles, use `allow`.
+- **Filtro por MAC:** o MAC de quem consulta vem da tabela ARP do lwIP (a placa e o aparelho estão na mesma rede). Com o filtro ligado, aparelhos fora da lista recebem `0.0.0.0` para qualquer domínio.
 - **Validação:** QNAMEs com ponteiros de compressão, rótulos inválidos ou mais de 253 caracteres são descartados.
 
 </details>
@@ -132,7 +138,7 @@ Como os 72 mil domínios em texto não caberiam nos ~320 KB de RAM da ESP32, a p
 | Log circular   | 50 entradas | domínio, bloqueado?, IP do cliente, horário      |
 | Histograma     | 60 × 1 min | gráfico "Atividade"                               |
 | Top bloqueados | 24 slots    | ranking aproximado (troca o de menor contagem)     |
-| Aparelhos      | 16 slots    | consultas e bloqueios por IP (troca o mais antigo) |
+| Aparelhos      | 32 slots    | consultas, bloqueios e MAC por IP (troca o mais antigo) |
 
 Tudo fica em RAM (~6 KB) e zera ao reiniciar. Nada é gravado na flash, para não desgastá-la.
 
@@ -253,7 +259,9 @@ No painel do seu roteador:
 
 Reconecte os aparelhos ao Wi-Fi (ou espere renovar o DHCP) e pronto.
 
-> ⚠️ Navegadores com **"DNS seguro"** (Chrome, Edge, Firefox) e o **"DNS privado"** do Android ignoram o DNS da rede. Desative essas opções para o bloqueio funcionar nesses aparelhos.
+> ⚠️ O roteador deve entregar **somente** o IP da placa como DNS (sem DNS secundário), e os aparelhos precisam consultar a placa diretamente: se o roteador repassar as consultas, todas chegam com o MAC dele e o filtro por MAC não distingue os aparelhos.
+>
+> ⚠️ A placa derruba os provedores de **"DNS seguro"** mais comuns, mas um provedor fora da lista ou um DNS fixo no aparelho (ex.: `8.8.8.8`) ainda passa por fora. Para fechar de vez, bloqueie no firewall do roteador a saída nas portas 53 e 853 para qualquer origem que não seja a placa.
 
 ### 5. Teste
 
@@ -276,6 +284,7 @@ Acesse **`http://192.168.0.120`** e entre com o mesmo usuário e senha do SSH.
 | **Proteção**                  | Liga/desliga, anel com a % bloqueada e pausa de 5 min, 30 min ou 1 h com contagem regressiva  |
 | **Consultas recentes**          | Filtro por texto e status. Bloqueie ou libere direto da linha                                 |
 | **Mais bloqueados / Aparelhos** | Rankings em tempo real                                                                        |
+| **Aparelhos · filtro por MAC** | Chave "Só autorizados", botão para autorizar ou revogar cada aparelho e lista de MACs autorizados |
 | **Listas pessoais**             | Adicione ou remova domínios bloqueados e liberados                                           |
 | **Sistema**                     | IP, sinal, memória, tempo ligado, troca do DNS externo, recarregar a lista e reiniciar       |
 
@@ -310,6 +319,9 @@ Ligado ha: 5h 12m
 | `block <domínio>` / `unblock <domínio>` | Lista pessoal de bloqueio (inclui subdomínios)    |
 | `allow <domínio>` / `unallow <domínio>` | Lista de liberados (vence as outras listas)        |
 | `list block` / `list allow`               | Mostra as listas pessoais                          |
+| `macfilter on` / `macfilter off` | Liga ou desliga o filtro por MAC |
+| `mac add <mac ou ip>` / `mac del <mac ou ip>` | Autoriza ou revoga um aparelho (pelo IP, usa o MAC visto na rede) |
+| `mac list` | Mostra os MACs autorizados |
 | `log`                                       | Últimas 32 consultas                              |
 | `upstream <ip>`                             | Troca o DNS externo                                |
 | `reload`                                    | Recarrega o`/block.bin`                          |
@@ -345,16 +357,18 @@ curl -u admin:SENHA -H "X-Req: 1" --data-urlencode "c=block tiktok.com" \
 {
   "state": "ATIVO",            // ATIVO | PAUSADO | DESLIGADO
   "pause": 0,                  // segundos restantes de pausa
+  "macfilter": 0,              // 1 = filtro por MAC ligado
   "total": 1532, "blocked": 412,
   "list": 72233,               // domínios na lista principal
   "upstream": "1.1.1.1", "ip": "192.168.0.120",
   "rssi": -38, "heap": 146208, "uptime": 18720,
   "cblock": ["tiktok.com"],    // lista pessoal
   "allow":  ["exemplo.com"],   // liberados
-  "log":     [["ads.exemplo.com", 1, "192.168.0.107", 4]],   // domínio, bloqueado, IP, s atrás
+  "macs":   ["aa:bb:cc:dd:ee:ff"],   // aparelhos autorizados
+  "log":     [["ads.exemplo.com", 1, "192.168.0.107", 4]],   // domínio, 0 permitido | 1 domínio bloqueado | 2 aparelho não autorizado, IP, s atrás
   "hist":    [[12, 3], [30, 9]],                             // 60 × [consultas, bloqueadas]
   "top":     [["doubleclick.net", 42]],                      // domínio, vezes
-  "clients": [["192.168.0.107", 900, 210, 2]]                // IP, consultas, bloqueadas, s atrás
+  "clients": [["192.168.0.107", 900, 210, 2, "aa:bb:cc:dd:ee:ff"]]   // IP, consultas, bloqueadas, s atrás, MAC
 }
 ```
 
@@ -395,6 +409,8 @@ esp32-adblock/
 
 ## ⚠️ Limitações e segurança
 
+- **O filtro por MAC só corta o DNS:** um aparelho não autorizado fica sem resolver nomes, mas quem configurar outro DNS manualmente ou clonar um MAC autorizado passa. Para barrar de verdade, use também o filtro de MAC do roteador.
+- **Bloqueio é por nome, não por IP:** conexões já abertas e apps que usam IP fixo não são afetados.
 - **Sem DNS sobre TCP:** respostas muito grandes (bit TC) não são reenviadas por TCP. Isso é raro no uso doméstico.
 - **A web usa HTTP sem TLS:** use só na rede local e **nunca** exponha as portas 80/22 para a internet.
 - **Credenciais no código:** não publique o `main.cpp` com sua senha real do Wi-Fi. Troque a senha padrão com `passwd` no primeiro acesso.

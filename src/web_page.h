@@ -135,6 +135,7 @@ svg{display:block}
 .btn.danger{background:var(--bad);border-color:transparent;color:#fff}.btn.danger:hover{filter:brightness(1.08)}
 .btn.ghost-danger{color:var(--bad)}
 .btn.sm{height:28px;padding:0 10px;font-size:12px;border-radius:8px}
+.btn:disabled{opacity:.45;cursor:default}
 .field{flex:1;min-width:0;height:38px;padding:0 12px;border-radius:11px;border:1px solid var(--border);background:var(--surface-2);outline:none;transition:border-color .15s,box-shadow .15s}
 .field:focus{border-color:var(--brand);box-shadow:0 0 0 4px var(--brand-soft);background:var(--surface)}
 
@@ -170,8 +171,11 @@ svg{display:block}
 .bar{height:6px;border-radius:99px;background:var(--grid);overflow:hidden}
 .bar i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--bad),color-mix(in srgb,var(--bad) 60%,var(--warn)));transition:width .6s cubic-bezier(.2,.8,.2,1)}
 .bar.dev i{background:linear-gradient(90deg,var(--brand),var(--brand-2))}
-.dev-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:12px;align-items:center}
+.dev-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px;align-items:center}
 .avatar{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;background:var(--brand-soft);color:var(--brand)}
+.avatar.off{background:var(--bad-soft);color:var(--bad)}
+.rank.scroll{max-height:340px;overflow:auto}
+.sw-lbl{display:flex;align-items:center;gap:10px;font-size:12.5px;font-weight:600;color:var(--muted)}
 .dev-row .s{font-size:12px;color:var(--faint)}
 
 /* listas */
@@ -310,7 +314,14 @@ footer{margin-top:28px;text-align:center;color:var(--faint);font-size:12px}
     </div>
     <div class="stack">
       <div class="card"><div class="card-h"><div><h2>Mais bloqueados</h2><p>Desde que a placa ligou</p></div></div><div class="rank" id="top"></div></div>
-      <div class="card"><div class="card-h"><div><h2>Aparelhos</h2><p>Quem mais faz consultas</p></div></div><div class="rank" id="clients"></div></div>
+      <div class="card"><div class="card-h"><div><h2>Aparelhos</h2><p id="devSub">Quem mais faz consultas</p></div>
+          <div class="sw-lbl">Só autorizados<button class="switch" id="macSw" role="switch" aria-checked="false" aria-label="Atender só aparelhos com MAC autorizado"><span></span></button></div></div>
+        <div class="rank scroll" id="clients"></div>
+        <div class="divider"></div>
+        <div class="p-label">MACs autorizados</div>
+        <form class="add" id="macForm"><input class="field mono" id="macIn" placeholder="MAC ou IP do aparelho" autocomplete="off" spellcheck="false" aria-label="MAC ou IP do aparelho"><button class="btn primary">Autorizar</button></form>
+        <div class="pills" id="macs"></div>
+      </div>
     </div>
   </section>
 
@@ -365,7 +376,7 @@ const $ = id => document.getElementById(id);
 const nf = new Intl.NumberFormat('pt-BR');
 const el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
 const icon = (id, size = 14) => { const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); s.setAttribute('width', size); s.setAttribute('height', size); const u = document.createElementNS('http://www.w3.org/2000/svg', 'use'); u.setAttribute('href', '#' + id); s.append(u); return s; };
-let prevTotal = null, newRows = new Set(), S = null, lastOk = 0, pauseLeft = 0, logFilter = 'all', listTab = 'cblock', hoverLog = false, firstLoad = true, sig = {};
+let prevTotal = null, newRows = new Set(), S = null, lastOk = 0, pauseLeft = 0, logFilter = 'all', listTab = 'cblock', hoverLog = false, hoverDev = false, firstLoad = true, sig = {};
 
 /* ---------- tema ---------- */
 function curTheme() { const t = document.documentElement.dataset.theme; return t || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); }
@@ -443,6 +454,8 @@ function renderState(s) {
   chip.className = 'chip ' + cls; $('chipTxt').textContent = txt;
   sw.setAttribute('aria-checked', s.state === 'ATIVO'); sw.classList.toggle('paused', s.state === 'PAUSADO');
   pauseLeft = s.pause || 0; tickPause();
+  $('macSw').setAttribute('aria-checked', !!s.macfilter);
+  $('devSub').textContent = s.macfilter ? 'Só os autorizados recebem resposta de DNS' : 'Quem mais faz consultas';
 }
 function tickPause() {
   const st = S ? S.state : '';
@@ -471,32 +484,48 @@ function renderLog(s) {
   for (const row of rows) {
     const [n, b, ip, a] = row;
     const r = el('div', 'lrow' + (newRows.has(row) ? ' new' : ''));
-    const st = el('span', 'st ' + (b ? 't-bad' : 't-ok')); st.append(icon(b ? 'i-ban' : 'i-check', 13));
+    const st = el('span', 'st ' + (b === 2 ? 't-warn' : b ? 't-bad' : 't-ok')); st.append(icon(b === 2 ? 'i-dev' : b ? 'i-ban' : 'i-check', 13));
     const meta = el('span', 'meta'); const agoEl = el('span', '', ago(a)); agoEl.setAttribute('data-ago', '');
     meta.append(el('span', 'mono', ip), document.createTextNode(' · '), agoEl);
-    const act = el('button', 'btn sm act', b ? 'Liberar' : 'Bloquear'); act.onclick = () => cmd((b ? 'allow ' : 'block ') + n);
-    r.append(st, el('span', 'd', n), meta, act); r.title = n; box.append(r);
+    const act = el('button', 'btn sm act', b === 2 ? 'Autorizar' : b ? 'Liberar' : 'Bloquear'); act.onclick = () => cmd(b === 2 ? 'mac add ' + ip : (b ? 'allow ' : 'block ') + n);
+    r.append(st, el('span', 'd', n), meta, act); r.title = b === 2 ? n + ' · aparelho não autorizado' : n; box.append(r);
   }
   newRows.clear();
 }
-function renderRank(id, items, kind) {
-  if (!changed(id, items)) return; const box = $(id); box.replaceChildren();
-  if (!items.length) { box.append(empty(kind === 'top' ? 'Nada bloqueado ainda' : 'Nenhum aparelho ainda', kind === 'top' ? 'i-ban' : 'i-dev')); return; }
-  if (kind === 'top') {
-    const list = [...items].sort((a, b) => b[1] - a[1]).slice(0, 8), max = list[0][1];
-    for (const [n, c] of list) {
-      const r = el('div', 'rk'), t = el('div', 'rk-top'); t.append(el('span', '', n), el('span', 'num', nf.format(c) + '×'));
-      const bar = el('div', 'bar'), i = el('i'); i.style.width = (c / max * 100) + '%'; bar.append(i); r.append(t, bar); r.title = n; box.append(r);
-    }
-  } else {
-    const list = [...items].sort((a, b) => b[1] - a[1]).slice(0, 6), max = list[0][1];
-    for (const [ip, t, b, a] of list) {
-      const r = el('div', 'dev-row'), av = el('span', 'avatar'); av.append(icon('i-dev', 16));
-      const body = el('div', 'rk'), top = el('div', 'rk-top'); top.append(el('span', 'mono', ip), el('span', 'num', nf.format(t)));
-      const bar = el('div', 'bar dev'), i = el('i'); i.style.width = (t / max * 100) + '%'; bar.append(i);
-      body.append(top, bar, el('span', 's', nf.format(b) + ' bloqueadas · visto ' + (a < 5 ? 'agora' : 'há ' + ago(a))));
-      r.append(av, body); box.append(r);
-    }
+function renderTop(items) {
+  if (!changed('top', items)) return; const box = $('top'); box.replaceChildren();
+  if (!items.length) { box.append(empty('Nada bloqueado ainda', 'i-ban')); return; }
+  const list = [...items].sort((a, b) => b[1] - a[1]).slice(0, 8), max = list[0][1];
+  for (const [n, c] of list) {
+    const r = el('div', 'rk'), t = el('div', 'rk-top'); t.append(el('span', '', n), el('span', 'num', nf.format(c) + '×'));
+    const bar = el('div', 'bar'), i = el('i'); i.style.width = (c / max * 100) + '%'; bar.append(i); r.append(t, bar); r.title = n; box.append(r);
+  }
+}
+function renderClients(s) {
+  if (hoverDev && !firstLoad) return;   // nao troca os botoes debaixo do mouse
+  const box = $('clients'), list = [...s.clients].sort((a, b) => b[1] - a[1]);
+  if (!changed('clients', [list, s.macs, s.macfilter])) return;
+  box.replaceChildren();
+  if (!list.length) { box.append(empty('Nenhum aparelho ainda', 'i-dev')); return; }
+  const max = list[0][1];
+  for (const [ip, t, b, a, mac] of list) {
+    const ok = s.macs.includes(mac), r = el('div', 'dev-row'), av = el('span', 'avatar' + (s.macfilter && !ok ? ' off' : '')); av.append(icon('i-dev', 16));
+    const body = el('div', 'rk'), top = el('div', 'rk-top'); top.append(el('span', 'mono', ip), el('span', 'num', nf.format(t)));
+    const bar = el('div', 'bar dev'), i = el('i'); i.style.width = (t / max * 100) + '%'; bar.append(i);
+    body.append(top, bar, el('span', 's', (mac ? mac + ' · ' : '') + nf.format(b) + ' bloqueadas · visto ' + (a < 5 ? 'agora' : 'há ' + ago(a))));
+    const act = el('button', 'btn sm', ok ? 'Revogar' : 'Autorizar'); act.disabled = !mac; if (!mac) act.title = 'MAC ainda não identificado';
+    act.onclick = () => { hoverDev = false; cmd((ok ? 'mac del ' : 'mac add ') + mac); };
+    r.append(av, body, act); box.append(r);
+  }
+}
+function renderMacs(s) {
+  if (!changed('macs', s.macs)) return;
+  const box = $('macs'); box.replaceChildren();
+  if (!s.macs.length) { box.append(empty('Nenhum aparelho autorizado', 'i-dev')); box.firstChild.style.width = '100%'; return; }
+  for (const m of s.macs) {
+    const p = el('span', 'pill'), x = el('button'); x.title = 'Remover'; x.setAttribute('aria-label', 'Remover ' + m); x.append(icon('i-x', 11));
+    x.onclick = () => cmd('mac del ' + m);
+    p.append(el('span', 'mono', m), x); box.append(p);
   }
 }
 function renderLists(s) {
@@ -529,7 +558,7 @@ async function load() {
     newRows = new Set(prevTotal === null ? [] : S.log.slice(0, Math.max(0, Math.min(S.total - prevTotal, S.log.length)))); prevTotal = S.total;
     lastOk = Date.now(); $('offline').hidden = true;
     renderState(S); renderKpis(S); drawChart(S.hist); renderLog(S);
-    renderRank('top', S.top, 'top'); renderRank('clients', S.clients, 'dev'); renderLists(S); renderSys(S);
+    renderTop(S.top); renderClients(S); renderMacs(S); renderLists(S); renderSys(S);
     firstLoad = false; $('upd').textContent = 'atualizado às ' + new Date().toLocaleTimeString('pt-BR');
   } catch (e) {
     if (Date.now() - lastOk > 7000) { $('offline').hidden = false; $('chip').className = 'chip offline'; $('chipTxt').textContent = 'Offline'; }
@@ -542,6 +571,9 @@ document.querySelectorAll('.seg button').forEach(b => b.onclick = () => cmd('pau
 $('logTabs').onclick = e => { const b = e.target.closest('button'); if (!b) return; logFilter = b.dataset.f; [...$('logTabs').children].forEach(x => x.setAttribute('aria-selected', x === b)); S && renderLog(S); };
 $('logQ').oninput = () => S && renderLog(S);
 $('log').onmouseenter = () => hoverLog = true; $('log').onmouseleave = () => { hoverLog = false; S && renderLog(S); };
+$('clients').onmouseenter = () => hoverDev = true; $('clients').onmouseleave = () => { hoverDev = false; S && renderClients(S); };
+$('macSw').onclick = () => cmd('macfilter ' + (S && S.macfilter ? 'off' : 'on'));
+$('macForm').onsubmit = e => { e.preventDefault(); const v = $('macIn').value.trim(); if (!v) return; cmd('mac add ' + v); $('macIn').value = ''; };
 $('listTabs').onclick = e => { const b = e.target.closest('button'); if (!b) return; listTab = b.dataset.l; [...$('listTabs').children].forEach(x => x.setAttribute('aria-selected', x === b));
   $('addBtn').textContent = listTab === 'cblock' ? 'Bloquear' : 'Liberar'; S && renderLists(S); };
 $('addForm').onsubmit = e => { e.preventDefault(); const d = $('addIn').value.trim(); if (!d) return; cmd((listTab === 'cblock' ? 'block ' : 'allow ') + d); $('addIn').value = ''; };

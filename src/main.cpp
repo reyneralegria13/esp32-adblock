@@ -15,14 +15,16 @@
 #include "libssh_esp32.h"
 #include <libssh/libssh.h>
 #include <libssh/server.h>
+#include <lwip/etharp.h>
+#include <lwip/netif.h>
 
 // ===================== CONFIGURACAO =====================
 const char* WIFI_SSID = "seu SSID - WIFI aqui"; // Precisa ser uma rede 2.4Ghz
 const char* WIFI_PASS = "sua senha aqui";
 
 #define USE_STATIC_IP 1                 // 0 = usar DHCP (faca reserva no roteador)
-IPAddress LOCAL_IP(192, 168, 0, 120); // set o IP estatico que deseja que a placa se conecte, verifique sua faixa de IP
-IPAddress GATEWAY(192, 168, 0, 1);    // set o IP do gateway, verifique sua rede
+IPAddress LOCAL_IP(192, 168, 68, 105); // set o IP estatico que deseja que a placa se conecte, verifique sua faixa de IP
+IPAddress GATEWAY(192, 168, 68, 1);    // set o IP do gateway, verifique sua rede
 IPAddress SUBNET(255, 255, 255, 0);   // set a subnet mask
 
 const char* SSH_USER         = "admin";
@@ -37,16 +39,17 @@ SemaphoreHandle_t lock;
 
 File blockFile;
 uint32_t blockCount = 0;
-std::set<String> customBlock, allowList;
+std::set<String> customBlock, allowList, macList;
 IPAddress upstream;
 bool blockingOn = true;
+bool macFilter = false;    // true = so atende aparelhos com MAC em macList
 uint32_t pauseUntil = 0;
 String sshPass;
 volatile bool rebootPending = false;
 volatile uint32_t qTotal = 0, qBlocked = 0;
 
 #define LOG_LEN 50
-struct LogEntry { char name[64]; bool blocked; uint32_t ip; uint32_t t; };
+struct LogEntry { char name[64]; uint8_t blocked; uint32_t ip; uint32_t t; };   // blocked: 1 = dominio, 2 = aparelho nao autorizado
 LogEntry logBuf[LOG_LEN];
 uint8_t logPos = 0;
 
@@ -59,8 +62,11 @@ uint32_t histStart = 0;
 struct TopEntry { char name[64]; uint32_t count; };
 TopEntry topBlocked[TOP_LEN];
 
-#define CLIENT_LEN 16                  // aparelhos que mais consultam
-struct ClientEntry { uint32_t ip, total, blocked, last; };
+#define CLIENT_LEN 32                  // aparelhos que mais consultam
+struct ClientEntry { uint32_t ip, total, blocked, last; uint8_t mac[6]; bool hasMac; };
+#define MAC_KEEP_MS 600000UL           // por quanto tempo o ultimo MAC visto num IP ainda vale
+
+#define MAX_TTL 120                    // segundos: um dominio recem-bloqueado para de abrir em ate 2 min
 ClientEntry clients[CLIENT_LEN];
 
 #define RECENT_BLOCKED 4               // ultimos bloqueios mostrados na tela
@@ -145,12 +151,64 @@ bool matchSuffix(const std::set<String>& s, String d) {
   }
 }
 
-// 0 = permitido, 1 = lista principal, 2 = lista pessoal, 3 = liberado
+// DNS criptografado (DoH/DoT) e reles que passam por fora da placa. Sao respondidos com NXDOMAIN,
+// que e o sinal que Firefox e iCloud esperam para voltar a usar o DNS da rede
+const char* const BYPASS[] = {
+  "use-application-dns.net",                  // Firefox desliga o DoH automatico
+  "mask.icloud.com", "mask-h2.icloud.com",    // iCloud Private Relay
+  "dns.google", "dns.google.com", "cloudflare-dns.com", "one.one.one.one",
+  "dns.quad9.net", "dns11.quad9.net", "doh.opendns.com", "dns.adguard.com", "dns.adguard-dns.com",
+  "dns.nextdns.io", "doh.cleanbrowsing.org", "doh.dns.sb", "dns.mullvad.net",
+};
+
+bool isBypass(const String& d) {
+  for (const char* b : BYPASS) {
+    size_t n = strlen(b);
+    if (d.endsWith(b) && (d.length() == n || d[d.length() - n - 1] == '.')) return true;
+  }
+  return false;
+}
+
+// 0 = permitido, 1 = lista principal, 2 = lista pessoal, 3 = liberado, 4 = DNS criptografado
 int classify(const String& d) {
   if (matchSuffix(allowList, d)) return 3;
   if (matchSuffix(customBlock, d)) return 2;
+  if (isBypass(d)) return 4;
   if (inBlockFileSuffix(d)) return 1;
   return 0;
+}
+
+// ---------- aparelhos (MAC) ----------
+String macStr(const uint8_t* m) {
+  char b[18];
+  snprintf(b, sizeof(b), "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+  return b;
+}
+
+bool cleanMac(String& m) {   // aceita AA-BB-CC-DD-EE-FF ou aa:bb:cc:dd:ee:ff
+  m.trim(); m.toLowerCase(); m.replace('-', ':');
+  if (m.length() != 17) return false;
+  for (int i = 0; i < 17; i++)
+    if (i % 3 == 2 ? m[i] != ':' : !isxdigit(m[i])) return false;
+  return true;
+}
+
+// MAC de um IP da rede local: tabela ARP do lwIP ou, se ela ja esqueceu, o ultimo MAC visto nesse IP
+bool clientMac(IPAddress ip, uint8_t* mac) {
+  ip4_addr_t a;
+  a.addr = (uint32_t)ip;
+  struct eth_addr* eth = NULL;
+  const ip4_addr_t* found = NULL;
+  if (netif_default && etharp_find_addr(netif_default, &a, &eth, &found) >= 0) {
+    memcpy(mac, eth->addr, 6);
+    return true;
+  }
+  bool ok = false;
+  xSemaphoreTake(lock, portMAX_DELAY);
+  for (const auto& c : clients)
+    if (c.ip == a.addr && c.hasMac && millis() - c.last < MAC_KEEP_MS) { memcpy(mac, c.mac, 6); ok = true; break; }
+  xSemaphoreGive(lock);
+  return ok;
 }
 
 bool blockingActive() {
@@ -160,7 +218,7 @@ bool blockingActive() {
   return true;
 }
 
-void addLog(const String& name, bool blocked, uint32_t ip) {
+void addLog(const String& name, uint8_t blocked, uint32_t ip, const uint8_t* mac) {
   uint32_t now = millis();
   xSemaphoreTake(lock, portMAX_DELAY);
   LogEntry& le = logBuf[logPos];
@@ -178,11 +236,12 @@ void addLog(const String& name, bool blocked, uint32_t ip) {
     if (clients[i].last < clients[ci].last || !clients[i].ip) ci = i;
   }
   if (clients[ci].ip != ip) clients[ci] = {ip, 0, 0, 0};
+  if (mac) { memcpy(clients[ci].mac, mac, 6); clients[ci].hasMac = true; }
   clients[ci].total++;
   if (blocked) clients[ci].blocked++;
   clients[ci].last = now;
 
-  if (blocked) {
+  if (blocked == 1) {
     strlcpy(recentBlocked[recentPos], le.name, sizeof(recentBlocked[0]));
     recentPos = (recentPos + 1) % RECENT_BLOCKED;
     // ranking: soma no existente ou substitui o de menor contagem
@@ -222,13 +281,14 @@ int parseName(const uint8_t* b, int len, String& out) {   // retorna fim do QNAM
   return -1;
 }
 
-void sendBlocked(IPAddress ip, uint16_t port, int qend, uint16_t qtype) {
+// rcode 0 = responde 0.0.0.0 / ::; outro (2 SERVFAIL, 3 NXDOMAIN) = so o codigo de erro, sem resposta
+void sendBlocked(IPAddress ip, uint16_t port, int qend, uint16_t qtype, uint8_t rcode = 0) {
   uint8_t r[600];
   memcpy(r, pkt, qend);
   r[2] = 0x80 | (pkt[2] & 0x79);   // resposta, mantem opcode e RD
-  r[3] = 0x80;                     // RA=1, sem erro
+  r[3] = 0x80 | rcode;             // RA=1
   r[4] = 0; r[5] = 1;              // 1 pergunta
-  bool ans = (qtype == 1 || qtype == 28);   // A ou AAAA
+  bool ans = !rcode && (qtype == 1 || qtype == 28);   // A ou AAAA
   r[6] = 0; r[7] = ans ? 1 : 0;
   r[8] = r[9] = r[10] = r[11] = 0;
   int p = qend;
@@ -266,18 +326,55 @@ bool handleClient() {
   if (qend < 0 || qend + 4 > len || qend + 4 > 560) return true;
   uint16_t qtype = (pkt[qend] << 8) | pkt[qend + 1];
   qend += 4;
+  uint8_t mac[6];
+  bool hasMac = clientMac(cip, mac);
+  // MAC ainda desconhecido: o SERVFAIL faz a placa descobrir o MAC (ARP) e o aparelho tentar de novo
+  if (macFilter && !hasMac) { sendBlocked(cip, cport, qend, qtype, 2); return true; }
   qTotal++;
-  bool blocked = false;
-  if (blockingActive()) {
-    xSemaphoreTake(lock, portMAX_DELAY);
-    int r = classify(name);
-    xSemaphoreGive(lock);
-    blocked = (r == 1 || r == 2);
-  }
-  addLog(name, blocked, (uint32_t)cip);
-  if (blocked) { qBlocked++; sendBlocked(cip, cport, qend, qtype); }
+  bool active = blockingActive();
+  int r = 0;
+  xSemaphoreTake(lock, portMAX_DELAY);
+  bool denied = macFilter && !macList.count(macStr(mac));
+  if (!denied && active) r = classify(name);
+  xSemaphoreGive(lock);
+  bool blocked = (r == 1 || r == 2 || r == 4);
+  addLog(name, denied ? 2 : blocked, (uint32_t)cip, hasMac ? mac : NULL);
+  if (denied || blocked) { qBlocked++; sendBlocked(cip, cport, qend, qtype, r == 4 ? 3 : 0); }
   else forwardQuery(cip, cport, len);
   return true;
+}
+
+int skipName(const uint8_t* b, int len, int p) {
+  while (p < len) {
+    uint8_t l = b[p];
+    if (l == 0) return p + 1;
+    if ((l & 0xC0) == 0xC0) return p + 2;   // ponteiro de compressao encerra o nome
+    if (l & 0xC0) return -1;
+    p += 1 + l;
+  }
+  return -1;
+}
+
+// limita o TTL das respostas repassadas, para os aparelhos nao guardarem por horas o IP de um
+// site que acabou de ser bloqueado
+void clampTtl(uint8_t* b, int len) {
+  int p = 12;
+  for (int q = (b[4] << 8) | b[5]; q > 0; q--) {
+    p = skipName(b, len, p);
+    if (p < 0) return;
+    p += 4;
+  }
+  int rr = ((b[6] << 8) | b[7]) + ((b[8] << 8) | b[9]) + ((b[10] << 8) | b[11]);
+  for (; rr > 0; rr--) {
+    p = skipName(b, len, p);
+    if (p < 0 || p + 10 > len) return;
+    uint16_t type = (b[p] << 8) | b[p + 1];
+    uint32_t ttl = ((uint32_t)b[p + 4] << 24) | (b[p + 5] << 16) | (b[p + 6] << 8) | b[p + 7];
+    if (type != 41 && ttl > MAX_TTL) {      // 41 = OPT (EDNS): ali o campo nao e TTL
+      b[p + 4] = b[p + 5] = 0; b[p + 6] = MAX_TTL >> 8; b[p + 7] = MAX_TTL & 0xFF;
+    }
+    p += 10 + ((b[p + 8] << 8) | b[p + 9]);
+  }
 }
 
 bool handleUpstream() {
@@ -292,6 +389,7 @@ bool handleUpstream() {
   Pending& e = *found;
   pkt[0] = e.origId >> 8; pkt[1] = e.origId & 0xFF;
   e.used = false;
+  clampTtl(pkt, len);
   udpDns.beginPacket(e.ip, e.port);
   udpDns.write(pkt, len);
   udpDns.endPacket();
@@ -310,18 +408,41 @@ const char* HELP =
   "  allow <dominio>     libera mesmo se estiver na lista\n"
   "  unallow <dominio>   remove da lista de liberados\n"
   "  list block|allow    mostra as listas pessoais\n"
-  "  log                 ultimas 32 consultas\n"
+  "  macfilter on|off    so atende aparelhos com MAC autorizado\n"
+  "  mac add <mac|ip>    autoriza um aparelho (pelo IP usa o MAC visto na rede)\n"
+  "  mac del <mac|ip>    remove a autorizacao\n"
+  "  mac list            mostra os aparelhos autorizados\n"
+  "  log                 ultimas 32 consultas ([X] dominio, [M] aparelho)\n"
   "  upstream <ip>       troca o DNS externo\n"
   "  reload              recarrega /block.bin\n"
   "  passwd <senha>      troca a senha do SSH\n"
   "  reboot              reinicia a ESP32\n"
   "  exit                encerra a sessao\n";
 
+// aceita tambem um endereco colado do navegador: https://usuario@site.com:443/pagina -> site.com
 String cleanDomain(String d) {
   d.trim(); d.toLowerCase();
+  int p = d.indexOf("://");
+  if (p >= 0) d = d.substring(p + 3);
+  for (char c : {'/', '?', '#'}) if ((p = d.indexOf(c)) >= 0) d = d.substring(0, p);
+  if ((p = d.lastIndexOf('@')) >= 0) d = d.substring(p + 1);
+  if ((p = d.indexOf(':')) >= 0) d = d.substring(0, p);
   if (d.startsWith("*.")) d = d.substring(2);
   while (d.endsWith(".")) d.remove(d.length() - 1);
   return d;
+}
+
+// dominio principal do site: pt.site.com -> site.com (mantem 3 partes em casos como site.com.br)
+String baseDomain(const String& d) {
+  int p2 = d.lastIndexOf('.');
+  int p1 = p2 > 0 ? d.lastIndexOf('.', p2 - 1) : -1;
+  if (p1 < 0) return d;
+  String sld = d.substring(p1 + 1, p2);
+  bool country = d.length() - p2 - 1 == 2 &&
+                 (sld == "com" || sld == "net" || sld == "org" || sld == "gov" || sld == "edu" || sld == "co");
+  if (!country) return d.substring(p1 + 1);
+  int p0 = p1 > 0 ? d.lastIndexOf('.', p1 - 1) : -1;
+  return p0 < 0 ? d : d.substring(p0 + 1);
 }
 
 String runCommand(String line, bool& quit) {
@@ -338,14 +459,19 @@ String runCommand(String line, bool& quit) {
   if (cmd == "status") {
     char b[512];
     uint32_t up = millis() / 1000;
+    xSemaphoreTake(lock, portMAX_DELAY);
+    unsigned macs = macList.size();
+    xSemaphoreGive(lock);
     const char* st = !blockingOn ? "DESLIGADO" : (blockingActive() ? "ATIVO" : "PAUSADO");
     snprintf(b, sizeof(b),
       "Bloqueio: %s\nConsultas: %u | bloqueadas: %u (%.1f%%)\n"
       "Lista principal: %u | pessoal: %u | liberados: %u\n"
+      "Filtro de MAC: %s | autorizados: %u\n"
       "DNS externo: %s\nIP: %s | sinal: %d dBm\n"
       "Memoria livre: %u bytes\nLigado ha: %uh %02um\n",
       st, (unsigned)qTotal, (unsigned)qBlocked, qTotal ? 100.0 * qBlocked / qTotal : 0.0,
       (unsigned)blockCount, (unsigned)customBlock.size(), (unsigned)allowList.size(),
+      macFilter ? "ATIVADO" : "DESATIVADO", macs,
       upstream.toString().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI(),
       (unsigned)ESP.getFreeHeap(), (unsigned)(up / 3600), (unsigned)((up / 60) % 60));
     return b;
@@ -362,7 +488,8 @@ String runCommand(String line, bool& quit) {
   if (cmd == "check") {
     if (!arg.length()) return "Uso: check <dominio>\n";
     const char* why[] = {"PERMITIDO", "BLOQUEADO (lista principal)",
-                         "BLOQUEADO (lista pessoal)", "PERMITIDO (lista de liberados)"};
+                         "BLOQUEADO (lista pessoal)", "PERMITIDO (lista de liberados)",
+                         "BLOQUEADO (DNS criptografado)"};
     xSemaphoreTake(lock, portMAX_DELAY);
     int r = classify(arg);
     xSemaphoreGive(lock);
@@ -372,9 +499,14 @@ String runCommand(String line, bool& quit) {
     if (arg.indexOf('.') < 0 || arg.indexOf(' ') >= 0) return "Dominio invalido\n";
     bool isAllow = cmd.endsWith("allow");
     bool add = (cmd == "block" || cmd == "allow");
+    String full = arg, raw = argRaw;
+    raw.toLowerCase();
+    // um endereco colado (https://pt.site.com/pagina) ou "www.site.com" vale para o site inteiro
+    if (add && argRaw.indexOf('/') >= 0) arg = baseDomain(arg);
+    else if (arg.startsWith("www.") && arg.indexOf('.', 4) > 0) arg = arg.substring(4);
     xSemaphoreTake(lock, portMAX_DELAY);
     std::set<String>& s = isAllow ? allowList : customBlock;
-    if (add) s.insert(arg); else s.erase(arg);
+    if (add) s.insert(arg); else { s.erase(arg); s.erase(full); s.erase(raw); }   // raw: entradas antigas salvas como URL
     saveSet(isAllow ? "allow" : "cblock", s);
     xSemaphoreGive(lock);
     return String(add ? "Adicionado em " : "Removido de ") +
@@ -388,12 +520,48 @@ String runCommand(String line, bool& quit) {
     xSemaphoreGive(lock);
     return out;
   }
+  if (cmd == "macfilter") {
+    if (argRaw != "on" && argRaw != "off") return "Uso: macfilter on|off\n";
+    xSemaphoreTake(lock, portMAX_DELAY);
+    bool none = macList.empty();
+    xSemaphoreGive(lock);
+    if (argRaw == "on" && none) return "Autorize pelo menos um aparelho antes (mac add)\n";
+    macFilter = (argRaw == "on");
+    prefs.putBool("macf", macFilter);
+    return macFilter ? "Filtro de MAC ATIVADO\n" : "Filtro de MAC DESATIVADO\n";
+  }
+  if (cmd == "mac") {
+    int s2 = argRaw.indexOf(' ');
+    String sub = s2 < 0 ? argRaw : argRaw.substring(0, s2);
+    String m = s2 < 0 ? "" : argRaw.substring(s2 + 1);
+    sub.toLowerCase();
+    if (sub == "list") {
+      String out = "Aparelhos autorizados:\n";
+      xSemaphoreTake(lock, portMAX_DELAY);
+      for (const auto& d : macList) out += "  " + d + "\n";
+      xSemaphoreGive(lock);
+      return out;
+    }
+    if (sub != "add" && sub != "del") return "Uso: mac add|del <mac ou ip> | mac list\n";
+    IPAddress ip;
+    uint8_t raw[6];
+    m.trim();
+    if (ip.fromString(m)) {
+      if (!clientMac(ip, raw)) return "MAC desconhecido para " + m + " (o aparelho precisa ter feito uma consulta)\n";
+      m = macStr(raw);
+    } else if (!cleanMac(m)) return "MAC invalido\n";
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (sub == "add") macList.insert(m); else macList.erase(m);
+    saveSet("macs", macList);
+    xSemaphoreGive(lock);
+    return String(sub == "add" ? "Aparelho autorizado: " : "Autorizacao removida: ") + m + "\n";
+  }
   if (cmd == "log") {
     String out;
     xSemaphoreTake(lock, portMAX_DELAY);
     for (int i = LOG_LEN - 32; i < LOG_LEN; i++) {
       const LogEntry& e = logBuf[(logPos + i) % LOG_LEN];
-      if (e.name[0]) out += String(e.blocked ? "[X] " : "[ ] ") + e.name + "\n";
+      if (e.name[0]) out += String(e.blocked == 2 ? "[M] " : e.blocked ? "[X] " : "[ ] ") + e.name + "\n";
     }
     xSemaphoreGive(lock);
     return out.length() ? out : "Sem consultas ainda\n";
@@ -702,11 +870,11 @@ void webStatus() {
   bool active = blockingActive();
   const char* st = !blockingOn ? "DESLIGADO" : (active ? "ATIVO" : "PAUSADO");
   uint32_t pauseLeft = (blockingOn && !active) ? (pauseUntil - millis()) / 1000 : 0;
-  char head[320];
+  char head[360];
   snprintf(head, sizeof(head),
-    "{\"state\":\"%s\",\"pause\":%u,\"total\":%u,\"blocked\":%u,\"list\":%u,"
+    "{\"state\":\"%s\",\"pause\":%u,\"macfilter\":%d,\"total\":%u,\"blocked\":%u,\"list\":%u,"
     "\"upstream\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"heap\":%u,\"uptime\":%u",
-    st, (unsigned)pauseLeft, (unsigned)qTotal, (unsigned)qBlocked, (unsigned)blockCount,
+    st, (unsigned)pauseLeft, (int)macFilter, (unsigned)qTotal, (unsigned)qBlocked, (unsigned)blockCount,
     upstream.toString().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI(),
     (unsigned)ESP.getFreeHeap(), (unsigned)(millis() / 1000));
   String j = head;
@@ -718,15 +886,17 @@ void webStatus() {
   j += "],\"allow\":[";
   for (const auto& d : allowList) { if (!first) j += ','; first = false; j += jsonStr(d.c_str()); }
   first = true;
+  j += "],\"macs\":[";
+  for (const auto& d : macList) { if (!first) j += ','; first = false; j += jsonStr(d.c_str()); }
   uint32_t now = millis();
   first = true;
-  j += "],\"log\":[";                                   // [dominio, bloqueado, ip, segundos atras]
+  j += "],\"log\":[";                                   // [dominio, 0 permitido | 1 dominio | 2 aparelho, ip, segundos atras]
   for (int i = LOG_LEN - 1; i >= 0; i--) {              // mais recente primeiro
     const LogEntry& e = logBuf[(logPos + i) % LOG_LEN];
     if (!e.name[0]) continue;
     if (!first) j += ',';
     first = false;
-    j += "[" + jsonStr(e.name) + (e.blocked ? ",1,\"" : ",0,\"") + IPAddress(e.ip).toString() +
+    j += "[" + jsonStr(e.name) + "," + String(e.blocked) + ",\"" + IPAddress(e.ip).toString() +
          "\"," + String((now - e.t) / 1000) + "]";
   }
   j += "],\"hist\":[";                                  // [consultas, bloqueadas] por minuto, antigo -> atual
@@ -744,14 +914,14 @@ void webStatus() {
     j += "[" + jsonStr(topBlocked[i].name) + "," + String(topBlocked[i].count) + "]";
   }
   first = true;
-  j += "],\"clients\":[";                               // [ip, consultas, bloqueadas, segundos atras]
+  j += "],\"clients\":[";                               // [ip, consultas, bloqueadas, segundos atras, mac]
   for (int i = 0; i < CLIENT_LEN; i++) {
     const ClientEntry& c = clients[i];
     if (!c.ip) continue;
     if (!first) j += ',';
     first = false;
     j += "[\"" + IPAddress(c.ip).toString() + "\"," + String(c.total) + "," + String(c.blocked) + "," +
-         String((now - c.last) / 1000) + "]";
+         String((now - c.last) / 1000) + ",\"" + (c.hasMac ? macStr(c.mac) : String()) + "\"]";
   }
   xSemaphoreGive(lock);
   j += "]}";
@@ -798,6 +968,8 @@ void setup() {
   upstream.fromString(prefs.getString("up", DEFAULT_UPSTREAM));
   customBlock = loadSet("cblock");
   allowList   = loadSet("allow");
+  macList     = loadSet("macs");
+  macFilter   = prefs.getBool("macf", false);
 
   if (!LittleFS.begin(true)) Serial.println("LittleFS falhou");
   openBlocklist();
